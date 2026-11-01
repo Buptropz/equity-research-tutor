@@ -1,6 +1,6 @@
 ﻿param([ValidateRange(1,4)][int]$Design = 1)
 $ErrorActionPreference = 'Stop'
-$designFiles = @('01-library.ico', '02-seal.ico', '03-insight.ico', '04-value.ico')
+$designFiles = @('01-library-red.ico', '02-seal-red.ico', '03-insight-red.ico', '04-value-red.ico')
 $iconPath = Join-Path $PSScriptRoot ('assets/icons/' + $designFiles[$Design - 1])
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) '研习股票研究.lnk'
 if (-not (Test-Path -LiteralPath $iconPath)) { throw '找不到图标文件，请将完整程序文件放在一起。' }
