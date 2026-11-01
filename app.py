@@ -21,6 +21,7 @@ from valuation import DEFAULTS, scenarios, reverse_dcf
 from ai_backend import codex_text,is_busy
 from maintenance import create_backup,list_backups,restore_backup,diagnostics,import_backup
 from translation import import_document,document,start_translation,export_translation,TranslationWorker
+from version import APP_VERSION
 
 ROOT=Path(__file__).resolve().parent
 
@@ -73,7 +74,7 @@ def report_data(store):
         for chunk in doc['chunks']:lines.extend([f"第{chunk['ordinal']}段 · {chunk['status']}",chunk['original'],chunk['translated'] or '尚未翻译',''])
     return state,'\n'.join(lines),dict(company=co,snapshots=snaps,facts=ledger,packs=state['packs'],valuations=state['valuations'],reviews=state['reviews'],chats=chats,documents=export_documents)
 
-def model_review(store, pack_id):
+def model_review(store, pack_id,expected_task=None):
     s=store.settings()
     if not s['model_enabled']:
         raise ValueError('请先在设置启用AI导师')
@@ -81,6 +82,8 @@ def model_review(store, pack_id):
         raise ValueError('请先填写模型接口与名称，或选择本机Codex')
     with store.connect() as c:
         p=c.execute('SELECT * FROM packs WHERE id=?',(pack_id,)).fetchone()
+        if expected_task and p and (p['revision']!=expected_task.get('revision') or p['snapshot_id']!=expected_task.get('snapshot_id')):
+            raise ValueError('任务资料版本已更新，请核对新版本后再请求点评')
         a=c.execute('SELECT * FROM answers WHERE pack_id=? AND revision=? ORDER BY id DESC LIMIT 1',(pack_id,p['revision'])).fetchone() if p else None
     if not p or not a or p['company_id']!=store.settings()['active_id']:
         raise ValueError('请先提交当前公司的回答')
@@ -112,13 +115,13 @@ def save_review(store,a,content,model):
         c.execute('UPDATE answers SET feedback=? WHERE id=?',(json.dumps(feedback,ensure_ascii=False),a['id']))
     return dict(review=content)
 
-def ai_chat(store,message):
+def ai_chat(store,message,frozen_state=None):
     if not isinstance(message,str) or not message.strip() or len(message)>6000:
         raise ValueError('请输入1—6000字的问题')
     settings=store.settings()
     if not settings['model_enabled'] or settings['model_provider']!='codex':
         raise ValueError('AI导师对话需要在设置中启用本机Codex')
-    state=store.state();co=state['active'];cid=co['id'] if co else None
+    state=frozen_state or store.state();co=state['active'];cid=co['id'] if co else None
     context=dict(company=co,messages=[dict(role=m['role'],content=m['content']) for m in state['chats'][-16:]],
                  latest_facts=state['facts'][:40],current_task=state['packs'][0]['payload'] if state['packs'] else None,
                  latest_valuation=state['valuations'][0]['payload'] if state['valuations'] else None,
@@ -152,6 +155,27 @@ class Application:
         return __import__('hashlib').sha256('|'.join(parts).encode()).hexdigest()
 
     def action(self,path,d):
+        d=dict(d);context=d.pop('_context',None)
+        scoped={'/api/document-import','/api/document-assign','/api/translate','/api/translation-pause','/api/translation-export','/api/pack','/api/refresh-pack','/api/fetch','/api/fact','/api/answer','/api/complete','/api/review-item','/api/restart','/api/hint','/api/valuation','/api/model-review','/api/ai-chat','/api/export'}
+        if path not in scoped:return self._action(path,d)
+        latest=path in {'/api/fact','/api/refresh-pack','/api/valuation','/api/ai-chat'}
+        pack_id=d.get('pack_id') if path in {'/api/answer','/api/complete','/api/hint','/api/model-review'} else None
+        # Short writes are atomic with validation. Long work pins the original company
+        # while allowing another page to navigate during a fetch or model response.
+        long=path in {'/api/document-import','/api/fetch','/api/ai-chat','/api/model-review','/api/export'}
+        if long:
+            with self.store.lock:
+                company_id=self.store.validate_context(context,latest,pack_id)
+                if path=='/api/ai-chat':d['_frozen_state']=self.store.state()
+                if path=='/api/model-review':d['_expected_task']=context.get('task')
+            with self.store.company_scope(company_id):
+                return dict(self._action(path,d),_company_id=company_id)
+        with self.store.lock:
+            company_id=self.store.validate_context(context,latest,pack_id)
+            with self.store.company_scope(company_id):
+                return dict(self._action(path,d),_company_id=company_id)
+
+    def _action(self,path,d):
         s=self.store
         if path=='/api/company':
             return s.add_company(d.get('ticker',''),d.get('name',''),d.get('cik',''))
@@ -181,7 +205,7 @@ class Application:
             with s.connect() as c:c.execute('UPDATE documents SET company_id=? WHERE id=?',(co['id'],doc['id']))
             return {}
         if path=='/api/translate':
-            return start_translation(s,int(d['document_id']),d.get('ordinal'))
+            return start_translation(s,int(d['document_id']),d.get('ordinal'),d.get('retry') is True)
         if path=='/api/translation-pause':
             doc=document(s,int(d['document_id']))
             with s.connect() as c:c.execute("UPDATE jobs SET status='PAUSED',updated=? WHERE document_id=? AND status IN ('PENDING','RUNNING')",(stamp(),doc['id']))
@@ -240,9 +264,9 @@ class Application:
         if path=='/api/model-review':
             if d.get('consent') is not True:
                 raise ValueError('请先确认将当前回答及所引用证据发送至配置的模型服务')
-            return model_review(s,int(d['pack_id']))
+            return model_review(s,int(d['pack_id']),d.get('_expected_task'))
         if path=='/api/ai-chat':
-            return ai_chat(s,d.get('message'))
+            return ai_chat(s,d.get('message'),d.get('_frozen_state'))
         if path=='/api/export':
             with self.export_lock:
                 state,report,ledger=report_data(s)
@@ -343,7 +367,7 @@ def handler(app):
                 self.send(403,dict(error='仅允许本机访问'));return
             path=urlparse(self.path).path
             if path=='/api/health':
-                self.send(200,dict(app='equity-research-tutor',version='1.1'));return
+                self.send(200,dict(app='equity-research-tutor',version=APP_VERSION));return
             if path in ['/api/state','/api/revision']:
                 if self.headers.get('X-App-Token')!=app.token:
                     self.send(403,dict(error='请从本机首页打开'));return

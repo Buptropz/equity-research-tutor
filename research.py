@@ -8,9 +8,12 @@ import threading
 import time
 import urllib.request
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
+from version import APP_VERSION
 
 TZ = dt.timezone(dt.timedelta(hours=8))
+UNBOUND=object()
 STAGES = ['理解企业', '阅读财报', '研究增长', '建立估值', '形成判断', '长期复盘']
 QUESTIONS = [
     ['这家公司向谁提供什么产品或服务？请定位收入分部披露。', '最主要的收入来源是什么？竞争优势有什么证据？', '什么变化可能削弱这种优势？写出可观察的指标。'],
@@ -39,6 +42,7 @@ class Store:
         self.folder.mkdir(parents=True, exist_ok=True)
         self.db = self.folder / 'research.sqlite3'
         self.lock = threading.RLock()
+        self._request_company=ContextVar('research_company_'+str(id(self)),default=UNBOUND)
         with self.connect() as c:
             c.executescript('''
             PRAGMA journal_mode=WAL;
@@ -57,6 +61,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS daily_runs(company_id INTEGER,study_date TEXT,attempts INTEGER DEFAULT 0,status TEXT,next_retry TEXT,error TEXT,PRIMARY KEY(company_id,study_date));
             CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY,company_id INTEGER,title TEXT,source_url TEXT,source_kind TEXT,report_period TEXT,sha256 TEXT,text TEXT,created TEXT);
             CREATE TABLE IF NOT EXISTS translation_chunks(id INTEGER PRIMARY KEY,document_id INTEGER,ordinal INTEGER,original TEXT,translated TEXT,status TEXT DEFAULT 'PENDING',number_check TEXT,error TEXT,model TEXT,updated TEXT,UNIQUE(document_id,ordinal));
+            CREATE TABLE IF NOT EXISTS translation_versions(id INTEGER PRIMARY KEY,chunk_id INTEGER,translated TEXT,status TEXT,number_check TEXT,error TEXT,model TEXT,created TEXT);
             CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,document_id INTEGER,status TEXT,completed INTEGER DEFAULT 0,total INTEGER,error TEXT,created TEXT,updated TEXT);
             ''')
             # Additive migration; existing answers keep the evidence cutoff they were submitted with.
@@ -89,7 +94,38 @@ class Store:
         if c is None:
             with self.connect() as c:
                 return self.settings(c)
-        return {r['key']: json.loads(r['value']) for r in c.execute('SELECT * FROM settings')}
+        settings={r['key']: json.loads(r['value']) for r in c.execute('SELECT * FROM settings')}
+        scoped=self._request_company.get()
+        if scoped is not UNBOUND:settings['active_id']=scoped
+        return settings
+
+    @contextmanager
+    def company_scope(self,company_id):
+        token=self._request_company.set(company_id)
+        try:yield
+        finally:self._request_company.reset(token)
+
+    def validate_context(self,context,latest=False,pack_id=None):
+        if not isinstance(context,dict) or 'company_id' not in context:
+            raise ValueError('页面版本已更新，请刷新后重试；未提交的草稿会保留')
+        company_id=context['company_id']
+        if company_id is not None and (type(company_id) is not int or company_id<=0):raise ValueError('页面公司身份无效，请刷新')
+        with self.connect() as c:
+            actual=json.loads(c.execute('SELECT value FROM settings WHERE key=?',('active_id',)).fetchone()[0])
+            if actual!=company_id:raise ValueError('当前公司已在其他页面切换。未保存到其他公司，请保留草稿并核对页面后重试')
+            if latest:
+                snap=c.execute('SELECT id FROM snapshots WHERE company_id=? ORDER BY id DESC LIMIT 1',(company_id,)).fetchone()
+                if 'snapshot_id' not in context or context['snapshot_id']!=(snap['id'] if snap else None):
+                    raise ValueError('财务资料已更新。请保留草稿，核对最新资料后重试')
+            task=context.get('task')
+            if pack_id is not None and (not isinstance(task,dict) or task.get('id')!=int(pack_id)):
+                raise ValueError('任务页面已变化，请重新打开当前任务；原始草稿会保留')
+            if task is not None:
+                if not isinstance(task,dict):raise ValueError('任务资料版本无效，请刷新')
+                row=c.execute('SELECT * FROM packs WHERE id=? AND company_id IS ?',(task.get('id'),company_id)).fetchone()
+                if not row or row['revision']!=task.get('revision') or row['snapshot_id']!=task.get('snapshot_id'):
+                    raise ValueError('任务资料版本已更新，请核对新版本后重新提交；旧回答保留')
+        return company_id
 
     def set_settings(self, data):
         allowed = {'reminder_enabled','reminder_time','frequency','start_date','sec_identity','mode','model_enabled','model_url','model_name','model_provider','codex_model'}
@@ -143,8 +179,8 @@ class Store:
                 raise ValueError('公司不存在')
             c.execute('UPDATE settings SET value=? WHERE key="active_id"',(json.dumps(int(company_id)),))
 
-    def company(self, company_id=None):
-        company_id=company_id or self.settings()['active_id']
+    def company(self, company_id=UNBOUND):
+        if company_id is UNBOUND:company_id=self.settings()['active_id']
         with self.connect() as c:
             row=c.execute('SELECT * FROM companies WHERE id=?',(company_id,)).fetchone()
             return dict(row) if row else None
@@ -318,12 +354,16 @@ class Store:
             documents=[dict(r) for r in c.execute('SELECT id,company_id,title,source_url,source_kind,report_period,sha256,created FROM documents WHERE company_id IS ? OR company_id IS NULL ORDER BY id DESC',(co['id'] if co else None,))]
             for doc in documents:
                 doc['chunks']=[dict(r) for r in c.execute('SELECT * FROM translation_chunks WHERE document_id=? ORDER BY ordinal',(doc['id'],))]
+                histories={}
+                for row in c.execute('SELECT v.* FROM translation_versions v JOIN translation_chunks c ON c.id=v.chunk_id WHERE c.document_id=? ORDER BY v.id DESC',(doc['id'],)):
+                    histories.setdefault(row['chunk_id'],[]).append(dict(row))
+                for chunk in doc['chunks']:chunk['versions']=histories.get(chunk['id'],[])
                 job=c.execute('SELECT * FROM jobs WHERE document_id=? ORDER BY id DESC LIMIT 1',(doc['id'],)).fetchone()
                 doc['job']=dict(job) if job else None
             daily_runs=[dict(r) for r in c.execute('SELECT * FROM daily_runs ORDER BY study_date DESC LIMIT 10')]
         snap=self.latest_snapshot(co['id']) if co else None
         return dict(settings=s,companies=companies,active=co,packs=packs,snapshot=snap,
-                    facts=self.get_facts(snap['id']) if snap else [], valuations=vals,reviews=reviews,chats=chats,documents=documents,daily_runs=daily_runs,notifications=notifications,events=events,stages=STAGES,today=now().date().isoformat(),version='1.1')
+                    facts=self.get_facts(snap['id']) if snap else [], valuations=vals,reviews=reviews,chats=chats,documents=documents,daily_runs=daily_runs,notifications=notifications,events=events,stages=STAGES,today=now().date().isoformat(),version=APP_VERSION)
 
     def schedule_tick(self, at=None):
         at=at or now(); s=self.settings()

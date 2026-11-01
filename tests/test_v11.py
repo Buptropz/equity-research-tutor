@@ -18,6 +18,7 @@ from valuation import DEFAULTS,dcf,scenarios
 from app import Application,ai_chat,report_data
 from maintenance import create_backup,restore_backup,list_backups,import_backup
 from translation import import_document,start_translation,TranslationWorker,verify_numbers,split_text,extract_html,export_translation,document
+from context_helpers import context_for
 
 class V11Tests(unittest.TestCase):
     def setUp(self):
@@ -170,11 +171,11 @@ class TranslationTests(unittest.TestCase):
             nonlocal count
             count+=1
             if count>1:raise ValueError('offline')
-            return args[1]['original']
+            return args[1]['original'].replace('Revenue','收入')
         with mock.patch('translation.codex_text',side_effect=fail_after_first):self.worker.tick()
         state=self.store.state()['documents'][0];self.assertEqual(state['job']['status'],'FAILED')
         first=state['chunks'][0]['translated'];start_translation(self.store,doc['id'])
-        with mock.patch('translation.codex_text',side_effect=lambda *a:a[1]['original']) as model:self.worker.tick()
+        with mock.patch('translation.codex_text',side_effect=lambda *a:a[1]['original'].replace('Revenue','收入')) as model:self.worker.tick()
         after=self.store.state()['documents'][0];self.assertEqual(after['job']['status'],'COMPLETED')
         self.assertEqual(after['chunks'][0]['translated'],first)
         self.assertEqual(model.call_count,len(after['chunks'])-1)
@@ -195,7 +196,7 @@ class TranslationTests(unittest.TestCase):
         doc=self.doc();co=self.store.add_company('AAPL');self.store.activate(co['id'])
         self.assertEqual(document(self.store,doc['id'])['company_id'],None)
         self.assertEqual(len(self.store.state()['documents']),1)
-        app=Application(self.store.folder);app.action('/api/document-assign',dict(document_id=doc['id']))
+        app=Application(self.store.folder);app.action('/api/document-assign',dict(document_id=doc['id'],_context=context_for(app.store)))
         self.assertEqual(document(self.store,doc['id'])['company_id'],co['id'])
         other=self.store.add_company('NVDA');self.store.activate(other['id'])
         with self.assertRaises(ValueError):document(self.store,doc['id'])

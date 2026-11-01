@@ -17,6 +17,29 @@ import zipfile
 
 from research import Store, stamp, now
 
+MAX_BACKUP_BYTES=250_000_000
+MAX_BACKUP_FILES=5000
+
+def file_sha256(file):
+    digest=hashlib.sha256()
+    with open(file,'rb') as source:
+        for chunk in iter(lambda:source.read(1024*1024),b''):digest.update(chunk)
+    return digest.hexdigest()
+
+def check_capacity(count,size):
+    if count>MAX_BACKUP_FILES or size>MAX_BACKUP_BYTES:
+        raise ValueError(f'备份超过可恢复范围：最多{MAX_BACKUP_FILES}个文件、展开后{MAX_BACKUP_BYTES/1_000_000:g}MB。请减少原始文件或分开归档后再备份')
+
+def validate_archive(z):
+    entries=z.infolist();names=[entry.filename for entry in entries]
+    check_capacity(len(entries),sum(entry.file_size for entry in entries))
+    if 'research.sqlite3' not in names or len(names)!=len(set(names)):
+        raise ValueError('备份缺少数据库或包含重复文件')
+    for name in names:
+        if name not in ['research.sqlite3','manifest.json'] and not re.fullmatch(r'(raw/[a-f0-9]{64}\.json|documents/[a-f0-9]{64}\.(pdf|txt|html))',name):
+            raise ValueError('备份包含非预期文件')
+    return entries
+
 def list_backups(store):
     folder=store.folder/'backups'
     return [dict(name=p.name,bytes=p.stat().st_size,modified=dt.datetime.fromtimestamp(p.stat().st_mtime,now().tzinfo).isoformat()) for p in sorted(folder.glob('*.zip'),key=lambda p:p.stat().st_mtime,reverse=True)] if folder.exists() else []
@@ -26,11 +49,7 @@ def import_backup(store,encoded):
         raw=base64.b64decode(encoded,validate=True)
         if len(raw)>18_000_000:raise ValueError('上传备份不能超过18MB；更大的备份可放入本地data/backups目录')
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            names=z.namelist()
-            if 'research.sqlite3' not in names or len(names)!=len(set(names)):raise ValueError('备份缺少数据库或包含重复文件')
-            if len(names)>5000 or sum(i.file_size for i in z.infolist())>250_000_000:raise ValueError('备份内容超出允许范围')
-            for name in names:
-                if name not in ['research.sqlite3','manifest.json'] and not re.fullmatch(r'(raw/[a-f0-9]{64}\.json|documents/[a-f0-9]{64}\.(pdf|txt|html))',name):raise ValueError('备份包含非预期文件')
+            validate_archive(z)
     except (zipfile.BadZipFile,TypeError):raise ValueError('不是有效的ZIP备份文件')
     folder=store.folder/'backups';folder.mkdir(exist_ok=True)
     name='imported-'+now().strftime('%Y%m%d-%H%M%S-%f')+'.zip'
@@ -42,12 +61,19 @@ def create_backup(store,automatic=False,label='manual'):
     if automatic:
         existing=list(folder.glob('auto-'+now().strftime('%Y%m%d')+'-*.zip'))
         if existing:
-            return existing[0].name
+            try:
+                with zipfile.ZipFile(existing[0]) as z:validate_archive(z)
+                return existing[0].name
+            except (ValueError,zipfile.BadZipFile):pass
     name=('auto' if automatic else label)+'-'+now().strftime('%Y%m%d-%H%M%S-%f')+'.zip'
     with store.lock,tempfile.TemporaryDirectory(dir=folder) as temp:
         if automatic:
             existing=list(folder.glob('auto-'+now().strftime('%Y%m%d')+'-*.zip'))
-            if existing:return existing[0].name
+            for previous in existing:
+                try:
+                    with zipfile.ZipFile(previous) as z:validate_archive(z)
+                    return previous.name
+                except (ValueError,zipfile.BadZipFile):pass
         db=Path(temp)/'research.sqlite3'
         with closing(sqlite3.connect(store.db)) as source,closing(sqlite3.connect(db)) as dest:
             source.backup(dest)
@@ -56,12 +82,22 @@ def create_backup(store,automatic=False,label='manual'):
             for p in (store.folder/directory).glob(extension):
                 if p.is_file() and not p.is_symlink():
                     files.append((p,directory+'/'+p.name))
-        manifest=dict(format='equity-research-tutor-backup',version=11,created=stamp(),files={arc:hashlib.sha256(p.read_bytes()).hexdigest() for p,arc in files})
+        # Apply the same budget used by import/restore, including the manifest entry.
+        check_capacity(len(files)+1,sum(p.stat().st_size for p,_ in files))
+        manifest=dict(format='equity-research-tutor-backup',version=11,created=stamp(),files={arc:file_sha256(p) for p,arc in files})
+        manifest_bytes=json.dumps(manifest,ensure_ascii=False).encode('utf-8')
+        check_capacity(len(files)+1,sum(p.stat().st_size for p,_ in files)+len(manifest_bytes))
         target=folder/name
-        with zipfile.ZipFile(target.with_suffix('.part'),'w',zipfile.ZIP_DEFLATED) as z:
-            for p,arc in files:z.write(p,arc)
-            z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False))
-        target.with_suffix('.part').replace(target)
+        partial=target.with_suffix('.part')
+        try:
+            with zipfile.ZipFile(partial,'w',zipfile.ZIP_DEFLATED) as z:
+                for p,arc in files:z.write(p,arc)
+                z.writestr('manifest.json',manifest_bytes)
+            with zipfile.ZipFile(partial) as z:validate_archive(z)
+            partial.replace(target)
+        except Exception:
+            partial.unlink(missing_ok=True)
+            raise
     if automatic:
         for p in sorted(folder.glob('auto-*.zip'),reverse=True)[7:]:
             p.unlink()
@@ -75,9 +111,7 @@ def restore_backup(store,name):
     with store.lock,tempfile.TemporaryDirectory(dir=store.folder/'backups') as temp:
         stage=Path(temp)/'data';stage.mkdir()
         with zipfile.ZipFile(archive) as z:
-            entries=z.infolist()
-            if len(entries)>5000 or sum(i.file_size for i in entries)>250_000_000:
-                raise ValueError('备份展开内容超出允许范围')
+            entries=validate_archive(z)
             names=[i.filename for i in entries]
             if len(names)!=len(set(names)) or 'research.sqlite3' not in names:
                 raise ValueError('备份缺少数据库或包含重复条目')
@@ -86,14 +120,15 @@ def restore_backup(store,name):
                 allowed=item in ['research.sqlite3','manifest.json'] or re.fullmatch(r'(raw/[a-f0-9]{64}\.json|documents/[a-f0-9]{64}\.(pdf|txt|html))',item)
                 if not allowed or PurePosixPath(item).is_absolute() or '..' in PurePosixPath(item).parts:
                     raise ValueError('备份包含非预期文件')
-                target=stage/item;target.parent.mkdir(exist_ok=True,parents=True);target.write_bytes(z.read(info))
+                target=stage/item;target.parent.mkdir(exist_ok=True,parents=True)
+                with z.open(info) as source,open(target,'wb') as dest:shutil.copyfileobj(source,dest,1024*1024)
             if 'manifest.json' in names:
                 manifest=json.loads((stage/'manifest.json').read_text(encoding='utf-8'))
                 if manifest.get('format')!='equity-research-tutor-backup':raise ValueError('备份格式无效')
                 actual=set(names)-{'manifest.json'}
                 if actual!=set(manifest.get('files',{})):raise ValueError('备份文件清单不一致')
                 for item,digest in manifest['files'].items():
-                    if hashlib.sha256((stage/item).read_bytes()).hexdigest()!=digest:raise ValueError('备份完整性校验失败')
+                    if file_sha256(stage/item)!=digest:raise ValueError('备份完整性校验失败')
         with closing(sqlite3.connect(stage/'research.sqlite3')) as source:
             if source.execute('PRAGMA quick_check').fetchone()[0]!='ok':raise ValueError('备份数据库损坏')
             if source.execute('PRAGMA user_version').fetchone()[0]>11:raise ValueError('备份版本高于当前程序，请先升级程序')

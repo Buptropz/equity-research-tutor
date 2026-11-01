@@ -15,6 +15,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from research import Store, extract_facts, now, fetch_sec
 from valuation import DEFAULTS, dcf, scenarios, reverse_dcf
 from app import Application, handler, ThreadingHTTPServer, model_review
+from context_helpers import context_for
 
 def fixture():
     recent=dict(form=[],filingDate=[],reportDate=[],accessionNumber=[],primaryDocument=[])
@@ -185,6 +186,7 @@ class HTTPTests(unittest.TestCase):
         self.url=f'http://127.0.0.1:{self.server.server_port}'
     def tearDown(self):self.server.shutdown();self.server.server_close();self.thread.join();self.tmp.cleanup()
     def req(self,path,data=None,token=True,origin=None):
+        if data is not None:data=dict(data,_context=data.get('_context',context_for(self.app.store)))
         headers={'X-App-Token':self.app.token} if token else {}
         if origin:headers['Origin']=origin
         request=urllib.request.Request(self.url+path,data=json.dumps(data).encode() if data is not None else None,headers=headers)

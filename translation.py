@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from ai_backend import codex_text,is_busy
 from research import stamp
+from translation_quality import numeric_tokens,verify_numbers,check_translation,QUALITY_VERSION
 
 MAX_FILE=18_000_000
 
@@ -56,16 +57,6 @@ def split_text(text,limit=3200):
             cut=limit+match.start() if match else len(pending)
         chunks.append(pending[:cut].strip());pending=pending[cut:].lstrip()
     return chunks
-
-def numeric_tokens(text):
-    # Exact digits, punctuation and percent signs: currency/unit conversion is forbidden.
-    number=r'[-−]?\d+(?:,\d{3})*(?:\.\d+)?(?:%|％)?'
-    tokens=re.findall(r'\(\s*'+number+r'\s*\)|(?<![A-Za-z\d])'+number,text)
-    return Counter(re.sub(r'\s+','',token) for token in tokens)
-
-def verify_numbers(original,translated):
-    source=numeric_tokens(original);target=numeric_tokens(translated)
-    return dict(ok=source==target,missing=list((source-target).elements()),added=list((target-source).elements()))
 
 def read_pdf(path):
     if importlib.util.find_spec('pypdf'):
@@ -140,7 +131,7 @@ def document(store,doc_id):
         if not row:raise ValueError('当前公司档案中没有这份财报')
         return dict(row)
 
-def start_translation(store,doc_id,ordinal=None):
+def start_translation(store,doc_id,ordinal=None,retry=False):
     doc=document(store,doc_id);settings=store.settings()
     if not settings['model_enabled'] or settings['model_provider']!='codex':raise ValueError('请先启用本机Codex AI，再翻译财报')
     with store.connect() as c:
@@ -150,6 +141,11 @@ def start_translation(store,doc_id,ordinal=None):
             ordinal=int(ordinal)
             exists=c.execute('SELECT 1 FROM translation_chunks WHERE document_id=? AND ordinal=?',(doc_id,ordinal)).fetchone()
             if not exists:raise ValueError('原文段落不存在')
+            if retry:
+                previous=c.execute('SELECT * FROM translation_chunks WHERE document_id=? AND ordinal=?',(doc_id,ordinal)).fetchone()
+                if previous['translated'] is not None:archive_translation(c,previous)
+                c.execute("UPDATE translation_chunks SET status='PENDING',error=NULL,updated=? WHERE document_id=? AND ordinal=?",(stamp(),doc_id,ordinal))
+        elif retry:raise ValueError('请指定要重译的段落，旧版译文会保留')
         # Selected scope is persisted in error-independent JSON using a dedicated job column.
         total=c.execute('SELECT COUNT(*) FROM translation_chunks WHERE document_id=?'+(' AND ordinal=?' if ordinal is not None else ''),(doc_id,ordinal) if ordinal is not None else (doc_id,)).fetchone()[0]
         c.execute('INSERT INTO jobs(document_id,status,completed,total,created,updated,scope) VALUES(?,?,?,?,?,?,?)',(doc_id,'PENDING',0,total,stamp(),stamp(),json.dumps(dict(ordinal=ordinal))))
@@ -160,9 +156,50 @@ def translate_chunk(store,chunk,doc):
     if not settings['model_enabled'] or settings['model_provider']!='codex':raise ValueError('AI已停用；启用本机Codex后可续翻')
     prompt='你是严谨的上市公司财报英译中译者。逐句完整翻译所给原文，不总结、不删减、不添加分析或外部事实。保留标题、段落、表格行列、GAAP/Non-GAAP区别、币种、单位、否定和条件措辞。所有阿拉伯数字及其逗号、小数点、正负号、百分号必须逐字保持，不换算为亿万，不新增数字。只输出中文译文正文，不输出前言、说明或代码围栏。保留原文已含中文页码标记。'
     translated=codex_text(prompt,dict(title=doc['title'],report_period=doc['report_period'],source_url=doc['source_url'],original=chunk['original']),settings['codex_model'],store.folder/'ai-runs')
-    check=verify_numbers(chunk['original'],translated)
+    check=check_translation(chunk['original'],translated)
     with store.connect() as c:
-        c.execute('UPDATE translation_chunks SET translated=?,status=?,number_check=?,error=NULL,model=?,updated=? WHERE id=?',(translated,'DONE' if check['ok'] else 'REVIEW',json.dumps(check,ensure_ascii=False),settings['codex_model'],stamp(),chunk['id']))
+        previous=c.execute('SELECT * FROM translation_chunks WHERE id=?',(chunk['id'],)).fetchone()
+        if previous['translated'] is not None and previous['status']!='PENDING':
+            archive_translation(c,previous)
+        c.execute('UPDATE translation_chunks SET translated=?,status=?,number_check=?,error=NULL,model=?,updated=? WHERE id=?',(translated,'DONE' if check['ok'] else ('REVIEW' if check['content']['ok'] else 'FAILED'),json.dumps(check,ensure_ascii=False),settings['codex_model'],stamp(),chunk['id']))
+    if not check['content']['ok']:raise ValueError('未获得有效中文译文：'+'；'.join(check['content']['issues'])+'。原文与返回内容已保留，可重试本段')
+
+def archive_translation(c,chunk):
+    c.execute('INSERT INTO translation_versions(chunk_id,translated,status,number_check,error,model,created) VALUES(?,?,?,?,?,?,?)',(chunk['id'],chunk['translated'],chunk['status'],chunk['number_check'],chunk['error'],chunk['model'],chunk['updated'] or stamp()))
+
+def recheck_saved_translations(store):
+    """Re-evaluate flags only. Never translate, delete original text or spend model quota."""
+    changed=0;last_id=0
+    while True:
+        with store.connect() as c:
+            batch=[dict(row) for row in c.execute('SELECT * FROM translation_chunks WHERE id>? AND translated IS NOT NULL ORDER BY id LIMIT 40',(last_id,))]
+        if not batch:break
+        for chunk in batch:
+            last_id=chunk['id']
+            try:previous=json.loads(chunk['number_check'] or '{}')
+            except ValueError:previous={}
+            if previous.get('version')==QUALITY_VERSION:continue
+            check=check_translation(chunk['original'],chunk['translated'])
+            status=chunk['status'];error=chunk['error']
+            if not check['content']['ok']:
+                status='FAILED';error='既有译文未通过中文正文检查，可重试本段'
+            elif not check['ok']:status='REVIEW'
+            if status=='REVIEW' and check['ok']:
+                check['issues'].append('历史待核对状态保留，请人工确认或重译');check['ok']=False
+            with store.connect() as c:
+                current=c.execute('SELECT * FROM translation_chunks WHERE id=?',(chunk['id'],)).fetchone()
+                if current['updated']!=chunk['updated'] or current['translated']!=chunk['translated']:continue
+                archive_translation(c,current)
+                c.execute('UPDATE translation_chunks SET status=?,number_check=?,error=?,updated=? WHERE id=?',(status,json.dumps(check,ensure_ascii=False),error,stamp(),chunk['id']))
+                if status=='FAILED':
+                    for job in c.execute("SELECT * FROM jobs WHERE document_id=? AND status='COMPLETED'",(chunk['document_id'],)).fetchall():
+                        scope=json.loads(job['scope'] or '{}').get('ordinal')
+                        if scope is None or scope==chunk['ordinal']:
+                            c.execute("UPDATE jobs SET status='FAILED',error='既有译文检查未通过，可续翻或重试',updated=? WHERE id=?",(stamp(),job['id']))
+            changed+=1
+    if changed:
+        with store.connect() as c:c.execute('INSERT INTO events(kind,detail,created) VALUES(?,?,?)',('译文重新检查',f'已检查{changed}个历史段落，原文与译文历史均保留，未调用模型',stamp()))
+    return changed
 
 class TranslationWorker:
     def __init__(self,store,stop_event):
@@ -202,6 +239,9 @@ class TranslationWorker:
             c.execute("UPDATE jobs SET status='COMPLETED',error=NULL,updated=? WHERE id=? AND status='RUNNING'",(stamp(),job['id']))
         return True
     def run(self):
+        try:recheck_saved_translations(self.store)
+        except Exception:
+            with self.store.connect() as c:c.execute('INSERT INTO events(kind,detail,created) VALUES(?,?,?)',('译文重新检查未完成','原始记录保留，可稍后重试',stamp()))
         while not self.stop_event.wait(1):
             try:self.tick()
             except Exception:
@@ -213,7 +253,11 @@ def export_translation(store,doc_id):
     lines=['# '+doc['title']+'｜中英对照',f"报告期：{doc['report_period'] or '未注明'}",f"来源：{doc['source_url'] or '用户上传或粘贴，来源待核实'}",f"原文件SHA-256：{doc['sha256']}",'机器译文，数字一致检查不代表翻译准确；请对照原始披露。','']
     for chunk in chunks:
         lines.extend([f"## 第{chunk['ordinal']}段 · {chunk['status']}",'### 原文',chunk['original'],'### 中文译文',chunk['translated'] or '尚未翻译',''])
-        if chunk['number_check'] and not json.loads(chunk['number_check'])['ok']:lines.append('数字检查有差异，请逐项对照原文。\n')
+        if chunk['number_check'] and not json.loads(chunk['number_check'])['ok']:
+            check=json.loads(chunk['number_check']);lines.append('译文待核对：'+'；'.join(check.get('issues', ['数字检查存在差异']))+'\n')
+        with store.connect() as c:versions=[dict(row) for row in c.execute('SELECT * FROM translation_versions WHERE chunk_id=? ORDER BY id',(chunk['id'],))]
+        for version in versions:
+            lines.extend([f"### 历史译文版本 {version['id']} · {version['status']} · {version['created']}",version['translated'],''])
     folder=store.folder.parent/'exports';folder.mkdir(exist_ok=True)
     name=f"translation_{doc_id}_{__import__('uuid').uuid4().hex[:8]}.md"
     (folder/name).write_text('\n'.join(lines),encoding='utf-8-sig')
