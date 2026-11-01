@@ -9,6 +9,9 @@ import threading
 
 _lock=threading.Lock()
 
+def is_busy():
+    return _lock.locked()
+
 def find_codex():
     direct=os.environ.get('ERT_CODEX_PATH') or shutil.which('codex')
     if direct and Path(direct).is_file():
@@ -47,7 +50,15 @@ def codex_text(instructions,context,model,work_dir):
             except subprocess.TimeoutExpired:
                 raise ValueError('Codex本次响应超时，请稍后重试；你的原始记录已保留')
             if result.returncode or not output.exists():
-                raise ValueError('Codex调用未完成。请确认本机Codex仍已登录、网络可用且账号额度可用；未改用其他付费接口')
+                detail=(result.stderr or '')+'\n'+(result.stdout or '')
+                detail=detail.lower()
+                if any(term in detail for term in ['unauthorized','not logged in','token expired','401']):hint='登录已失效，请在Codex中重新登录'
+                elif any(term in detail for term in ['usage limit','rate limit','quota','429']):hint='账号额度或调用频率受限，请稍后重试'
+                elif any(term in detail for term in ['model not found','unsupported model','does not exist']):hint='所选模型不可用，请检查模型名称或账号权限'
+                elif any(term in detail for term in ['unexpected argument','unrecognized','unknown variant']):hint='当前Codex版本参数不兼容，请检查或更新Codex'
+                elif any(term in detail for term in ['connection','timed out','network','dns']):hint='网络连接未完成，请检查网络后重试'
+                else:hint='请确认Codex登录、网络和账号额度可用'
+                raise ValueError('Codex调用未完成：'+hint+'。原记录已保留，未改用其他付费接口')
             content=output.read_text(encoding='utf-8').strip()
             if not content:
                 raise ValueError('Codex未返回文字，请稍后重试')

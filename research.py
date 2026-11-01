@@ -54,7 +54,18 @@ class Store:
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT,detail TEXT,created TEXT);
             CREATE TABLE IF NOT EXISTS review_items(id INTEGER PRIMARY KEY,company_id INTEGER,pack_id INTEGER,concept TEXT,status TEXT,created TEXT,reviewed TEXT);
             CREATE TABLE IF NOT EXISTS ai_messages(id INTEGER PRIMARY KEY,company_id INTEGER,role TEXT,content TEXT,model TEXT,created TEXT);
+            CREATE TABLE IF NOT EXISTS daily_runs(company_id INTEGER,study_date TEXT,attempts INTEGER DEFAULT 0,status TEXT,next_retry TEXT,error TEXT,PRIMARY KEY(company_id,study_date));
+            CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY,company_id INTEGER,title TEXT,source_url TEXT,source_kind TEXT,report_period TEXT,sha256 TEXT,text TEXT,created TEXT);
+            CREATE TABLE IF NOT EXISTS translation_chunks(id INTEGER PRIMARY KEY,document_id INTEGER,ordinal INTEGER,original TEXT,translated TEXT,status TEXT DEFAULT 'PENDING',number_check TEXT,error TEXT,model TEXT,updated TEXT,UNIQUE(document_id,ordinal));
+            CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,document_id INTEGER,status TEXT,completed INTEGER DEFAULT 0,total INTEGER,error TEXT,created TEXT,updated TEXT);
             ''')
+            # Additive migration; existing answers keep the evidence cutoff they were submitted with.
+            for table,name,definition in [('packs','revision','INTEGER DEFAULT 1'),('answers','snapshot_id','INTEGER'),('answers','revision','INTEGER DEFAULT 1'),('jobs','scope','TEXT')]:
+                if name not in [r['name'] for r in c.execute('PRAGMA table_info('+table+')')]:
+                    c.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition)
+                    if table=='answers' and name=='snapshot_id':
+                        c.execute('UPDATE answers SET snapshot_id=(SELECT snapshot_id FROM packs WHERE packs.id=answers.pack_id)')
+            c.execute('PRAGMA user_version=11')
             defaults = {'active_id': None, 'reminder_enabled': False, 'reminder_time': '10:00',
                         'frequency': 'daily', 'start_date': '2026-11-02', 'sec_identity': '',
                         'mode': 'tutor', 'model_enabled': False, 'model_url': '', 'model_name': '',
@@ -64,14 +75,15 @@ class Store:
 
     @contextmanager
     def connect(self):
-        c = sqlite3.connect(self.db, timeout=20)
-        c.row_factory = sqlite3.Row
-        c.execute('PRAGMA foreign_keys=ON')
-        try:
-            with c:
-                yield c
-        finally:
-            c.close()
+        with self.lock:
+            c = sqlite3.connect(self.db, timeout=20)
+            c.row_factory = sqlite3.Row
+            c.execute('PRAGMA foreign_keys=ON')
+            try:
+                with c:
+                    yield c
+            finally:
+                c.close()
 
     def settings(self, c=None):
         if c is None:
@@ -144,7 +156,7 @@ class Store:
 
     def get_facts(self,snapshot_id):
         with self.connect() as c:
-            return [dict(r) for r in c.execute('SELECT * FROM facts WHERE snapshot_id=? ORDER BY end DESC,metric',(snapshot_id,))]
+            return [dict(r) for r in c.execute('SELECT * FROM facts WHERE id IN (SELECT MAX(id) FROM facts WHERE snapshot_id=? GROUP BY metric,unit,start,end) ORDER BY end DESC,metric',(snapshot_id,))]
 
     def pack(self, day=None):
         company=self.company()
@@ -173,21 +185,22 @@ class Store:
                       (company['id'],snap['id'] if snap else None,day,company['stage'],'MATERIALS_READY' if ready else 'BLOCKED',json.dumps(payload,ensure_ascii=False),stamp()))
             return dict(c.execute('SELECT * FROM packs WHERE id=last_insert_rowid()').fetchone())
 
-    def refresh_pack(self):
+    def refresh_pack(self, unanswered_only=False):
         p=self.pack()
         if p['status']=='COMPLETED':
             raise ValueError('当天任务已完成，旧任务不会被改写')
         snap=self.latest_snapshot(p['company_id'])
         if not snap:
             raise ValueError('尚无资料快照')
-        with self.connect() as c:
-            # Once answered, its evidence cutoff must remain fixed.
-            if c.execute('SELECT 1 FROM answers WHERE pack_id=?',(p['id'],)).fetchone():
-                raise ValueError('该任务已有回答，证据时点已固定；新资料留待下一任务使用')
+        with self.lock,self.connect() as c:
+            answered=c.execute('SELECT 1 FROM answers WHERE pack_id=? AND revision=?',(p['id'],p['revision'])).fetchone()
+            if snap['id']==p['snapshot_id'] or (unanswered_only and answered):
+                return p
             payload=json.loads(p['payload'])
             official=any(f['status']=='official_xbrl' for f in self.get_facts(snap['id']))
             payload['verification']='官方XBRL已提取，仍需核对原表与附注' if official else '手动证据待核实'
-            c.execute('UPDATE packs SET snapshot_id=?,status=?,payload=? WHERE id=?',(snap['id'],'MATERIALS_READY' if official else 'BLOCKED',json.dumps(payload,ensure_ascii=False),p['id']))
+            payload['verification']+='；更新资料后须提交本版本回答' if answered else ''
+            c.execute('UPDATE packs SET snapshot_id=?,status=?,payload=?,revision=revision+1 WHERE id=?',(snap['id'],'MATERIALS_READY' if official else 'BLOCKED',json.dumps(payload,ensure_ascii=False),p['id']))
         return self.pack()
 
     def answer(self,pack_id,body):
@@ -219,7 +232,7 @@ class Store:
                     checks.append(dict(metric=key,correct=correct,error_type=None if correct else ('数值、期间或单位待核对' if expected else '证据不足')))
             feedback=dict(kind='规则检查',checks=checks,note='已保存原始回答。数值可与所绑定快照比较；文字推理尚需你审核，或主动请求模型点评。',
                           unresolved=['核对引用位置与原始财报','检查反方解释是否能挑战论点','确认不是只因做完题就视为完成尽调'])
-            c.execute('INSERT INTO answers(company_id,pack_id,body,feedback,created) VALUES(?,?,?,?,?)',(p['company_id'],p['id'],json.dumps(body,ensure_ascii=False),json.dumps(feedback,ensure_ascii=False),stamp()))
+            c.execute('INSERT INTO answers(company_id,pack_id,body,feedback,created,snapshot_id,revision) VALUES(?,?,?,?,?,?,?)',(p['company_id'],p['id'],json.dumps(body,ensure_ascii=False),json.dumps(feedback,ensure_ascii=False),stamp(),p['snapshot_id'],p['revision']))
             answer_id=c.execute('SELECT last_insert_rowid()').fetchone()[0]
             concepts=body.get('review_concepts','')
             if not isinstance(concepts,str):
@@ -240,9 +253,9 @@ class Store:
                 return
             if p['company_id']!=self.settings(c)['active_id']:
                 raise ValueError('请切换到任务所属公司')
-            a=c.execute('SELECT * FROM answers WHERE pack_id=? ORDER BY id DESC LIMIT 1',(pack_id,)).fetchone()
+            a=c.execute('SELECT * FROM answers WHERE pack_id=? AND revision=? ORDER BY id DESC LIMIT 1',(pack_id,p['revision'])).fetchone()
             if not a:
-                raise ValueError('请先提交回答，再审核并确认完成')
+                raise ValueError('请先提交当前资料版本的回答，再审核并确认完成')
             facts=self.get_facts(p['snapshot_id']) if p['snapshot_id'] else []
             if not facts:
                 raise ValueError('尚无证据，请先补充资料；已有回答将保留')
@@ -283,7 +296,7 @@ class Store:
             c.execute('INSERT INTO snapshots(company_id,as_of,created,status,payload) VALUES(?,?,?,?,?)',(co['id'],now().date().isoformat(),stamp(),'manual_unverified',json.dumps(dict(note='用户录入，未经官方抓取核验'),ensure_ascii=False)))
             sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
             if previous:
-                c.execute('INSERT INTO facts(snapshot_id,company_id,metric,value,unit,start,end,filed,form,tag,url,accession,status) SELECT ?,company_id,metric,value,unit,start,end,filed,form,tag,url,accession,status FROM facts WHERE snapshot_id=?',(sid,previous['id']))
+                c.execute('INSERT INTO facts(snapshot_id,company_id,metric,value,unit,start,end,filed,form,tag,url,accession,status) SELECT ?,company_id,metric,value,unit,start,end,filed,form,tag,url,accession,status FROM facts WHERE snapshot_id=? AND NOT(metric=? AND start=? AND end=? AND unit=?)',(sid,previous['id'],data['metric'],str(start),str(end),'USD'))
             c.execute('INSERT INTO facts(snapshot_id,company_id,metric,value,unit,start,end,filed,form,tag,url,accession,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,co['id'],data['metric'],value,'USD',str(start),str(end),str(filed),'手动录入',str(data.get('location',''))[:500],data['url'],'','manual_unverified'))
         return sid
 
@@ -294,7 +307,7 @@ class Store:
             packs=[dict(r) for r in c.execute('SELECT * FROM packs WHERE company_id=? ORDER BY id DESC',(co['id'] if co else None,))]
             for p in packs:
                 p['payload']=json.loads(p['payload'])
-                p['facts']=[dict(r) for r in c.execute('SELECT * FROM facts WHERE snapshot_id=? ORDER BY end DESC,metric',(p['snapshot_id'],))]
+                p['facts']=self.get_facts(p['snapshot_id'])
                 p['answers']=[{**dict(a),'body':json.loads(a['body']),'feedback':json.loads(a['feedback'])} for a in c.execute('SELECT * FROM answers WHERE pack_id=? ORDER BY id',(p['id'],))]
                 p['hint_count']=c.execute('SELECT COUNT(*) FROM hints WHERE pack_id=?',(p['id'],)).fetchone()[0]
             vals=[{**dict(r),'payload':json.loads(r['payload'])} for r in c.execute('SELECT * FROM valuations WHERE company_id=? ORDER BY id DESC',(co['id'] if co else None,))]
@@ -302,9 +315,15 @@ class Store:
             events=[dict(r) for r in c.execute('SELECT * FROM events ORDER BY id DESC LIMIT 10')]
             reviews=[dict(r) for r in c.execute('SELECT * FROM review_items WHERE company_id=? ORDER BY id DESC',(co['id'] if co else None,))]
             chats=[dict(r) for r in c.execute('SELECT * FROM (SELECT * FROM ai_messages WHERE company_id IS ? ORDER BY id DESC LIMIT 60) ORDER BY id',(co['id'] if co else None,))]
+            documents=[dict(r) for r in c.execute('SELECT id,company_id,title,source_url,source_kind,report_period,sha256,created FROM documents WHERE company_id IS ? OR company_id IS NULL ORDER BY id DESC',(co['id'] if co else None,))]
+            for doc in documents:
+                doc['chunks']=[dict(r) for r in c.execute('SELECT * FROM translation_chunks WHERE document_id=? ORDER BY ordinal',(doc['id'],))]
+                job=c.execute('SELECT * FROM jobs WHERE document_id=? ORDER BY id DESC LIMIT 1',(doc['id'],)).fetchone()
+                doc['job']=dict(job) if job else None
+            daily_runs=[dict(r) for r in c.execute('SELECT * FROM daily_runs ORDER BY study_date DESC LIMIT 10')]
         snap=self.latest_snapshot(co['id']) if co else None
         return dict(settings=s,companies=companies,active=co,packs=packs,snapshot=snap,
-                    facts=self.get_facts(snap['id']) if snap else [], valuations=vals,reviews=reviews,chats=chats,notifications=notifications,events=events,stages=STAGES,today=now().date().isoformat())
+                    facts=self.get_facts(snap['id']) if snap else [], valuations=vals,reviews=reviews,chats=chats,documents=documents,daily_runs=daily_runs,notifications=notifications,events=events,stages=STAGES,today=now().date().isoformat(),version='1.1')
 
     def schedule_tick(self, at=None):
         at=at or now(); s=self.settings()

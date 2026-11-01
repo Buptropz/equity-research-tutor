@@ -98,7 +98,11 @@ class StoreTests(unittest.TestCase):
         self.s.answer(p['id'],dict(self.body(),counter='新反方'))
         self.assertEqual(len(self.s.state()['packs'][0]['answers']),2)
         self.assertEqual(self.s.state()['packs'][0]['snapshot_id'],first)
-        with self.assertRaises(ValueError):self.s.refresh_pack()
+        self.s.refresh_pack()
+        state=self.s.state()['packs'][0]
+        self.assertEqual(state['revision'],2)
+        self.assertEqual(state['answers'][0]['snapshot_id'],first)
+        with self.assertRaisesRegex(ValueError,'当前资料版本'):self.s.complete(p['id'])
     def test_complete_requires_evidence_answers(self):
         p=self.s.pack()
         with self.assertRaises(ValueError):self.s.complete(p['id'])

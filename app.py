@@ -18,7 +18,9 @@ from urllib.parse import urlparse
 
 from research import Store, STAGES, HINTS, METRICS, now, stamp, fetch_sec
 from valuation import DEFAULTS, scenarios, reverse_dcf
-from ai_backend import codex_text
+from ai_backend import codex_text,is_busy
+from maintenance import create_backup,list_backups,restore_backup,diagnostics,import_backup
+from translation import import_document,document,start_translation,export_translation,TranslationWorker
 
 ROOT=Path(__file__).resolve().parent
 
@@ -36,7 +38,7 @@ def report_data(store):
     for p in reversed(state['packs']):
         lines.extend([f"## {p['study_date']} · {STAGES[p['stage']]}",f"任务#{p['id']} / {p['status']} / 证据快照：{p['snapshot_id']}",p['payload']['verification'],''])
         for a in p['answers']:
-            lines.extend([f"### 原始回答版本 {a['id']}（{a['created']}）"])
+            lines.extend([f"### 原始回答版本 {a['id']}（{a['created']}）",f"提交时证据快照：{a['snapshot_id']}；任务资料版本：{a['revision']}"])
             for q,v in zip(p['payload']['questions'],a['body']['responses']):
                 lines.extend([q,v,''])
             lines.extend(['反方解释：'+a['body']['counter'],'证伪条件：'+a['body']['falsification'],'反馈：'+json.dumps(a['feedback'],ensure_ascii=False),''])
@@ -51,6 +53,10 @@ def report_data(store):
     lines.extend(['## 证据账本','手动录入为待核实；官方XBRL仍须与原表核对。所有金额原始值为USD。',''])
     with store.connect() as c:
         snaps=[dict(r) for r in c.execute('SELECT * FROM snapshots WHERE company_id=? ORDER BY id',(co['id'],))]
+        chats=[dict(r) for r in c.execute('SELECT * FROM ai_messages WHERE company_id=? ORDER BY id',(co['id'],))]
+    lines.extend(['## AI导师完整对话',''])
+    for chat in chats:
+        lines.extend([f"### {chat['created']} · {chat['role']} · {chat['model']}",chat['content'],''])
     ledger=[]
     for s in snaps:
         facts=store.get_facts(s['id']);ledger.extend(facts)
@@ -60,7 +66,12 @@ def report_data(store):
     lines.extend(['','## 方法与范围','首版限定非金融美股的年度US-GAAP。季度、TTM、自定义标签及复杂重述须人工核对。',
                   '估值采用年末折现、增长/ROIC再投资模型；SBC保留为经济成本，未额外加回。稀释后股数、租赁与其他请求权须由用户明确纳入。',
                   '研究记录与学习完成不代表尽调完成；模型结果取决于用户假设。'])
-    return state,'\n'.join(lines),dict(company=co,snapshots=snaps,facts=ledger,packs=state['packs'],valuations=state['valuations'],reviews=state['reviews'])
+    lines.extend(['## 财报中英对照记录',''])
+    export_documents=[doc for doc in state['documents'] if doc['company_id']==co['id']]
+    for doc in export_documents:
+        lines.extend([f"### {doc['title']}",f"来源：{doc['source_url']}；报告期：{doc['report_period']}；SHA-256：{doc['sha256']}"])
+        for chunk in doc['chunks']:lines.extend([f"第{chunk['ordinal']}段 · {chunk['status']}",chunk['original'],chunk['translated'] or '尚未翻译',''])
+    return state,'\n'.join(lines),dict(company=co,snapshots=snaps,facts=ledger,packs=state['packs'],valuations=state['valuations'],reviews=state['reviews'],chats=chats,documents=export_documents)
 
 def model_review(store, pack_id):
     s=store.settings()
@@ -70,7 +81,7 @@ def model_review(store, pack_id):
         raise ValueError('请先填写模型接口与名称，或选择本机Codex')
     with store.connect() as c:
         p=c.execute('SELECT * FROM packs WHERE id=?',(pack_id,)).fetchone()
-        a=c.execute('SELECT * FROM answers WHERE pack_id=? ORDER BY id DESC LIMIT 1',(pack_id,)).fetchone()
+        a=c.execute('SELECT * FROM answers WHERE pack_id=? AND revision=? ORDER BY id DESC LIMIT 1',(pack_id,p['revision'])).fetchone() if p else None
     if not p or not a or p['company_id']!=store.settings()['active_id']:
         raise ValueError('请先提交当前公司的回答')
     facts=store.get_facts(p['snapshot_id']) if p['snapshot_id'] else []
@@ -112,6 +123,7 @@ def ai_chat(store,message):
                  latest_facts=state['facts'][:40],current_task=state['packs'][0]['payload'] if state['packs'] else None,
                  latest_valuation=state['valuations'][0]['payload'] if state['valuations'] else None,
                  question=message.strip())
+    context['study_answers']=[dict(task_id=p['id'],questions=p['payload']['questions'],answer=a['body'],feedback=a['feedback'],snapshot_id=a['snapshot_id'],revision=a['revision'],evidence=store.get_facts(a['snapshot_id'])[:12]) for p in state['packs'][:4] for a in p['answers'][-3:]]
     instructions='你是本地股票研究工作台的Codex AI导师，使用中文、清楚具体地回答。帮助用户阅读财报、理解概念、检查假设与反方证据。材料不足时说待核实，不编造财务数字或当前行情。没有指定公司时不擅自选股。事实、假设和判断分开。你没有当前Codex聊天的完整历史，只能使用给出的工作台记录。最多800字。'
     content=codex_text(instructions,context,settings['codex_model'],store.folder/'ai-runs')
     with store.connect() as c:
@@ -125,6 +137,19 @@ class Application:
         self.token=secrets.token_urlsafe(32)
         self.stop_event=threading.Event()
         self.export_lock=threading.Lock()
+        self.diagnostic_result=None
+        self.translation_worker=TranslationWorker(self.store,self.stop_event)
+
+    def state(self):
+        return dict(self.store.state(),backups=list_backups(self.store),diagnostics=self.diagnostic_result,revision=self.revision())
+
+    def revision(self):
+        parts=[now().date().isoformat(),str(self.diagnostic_result)]
+        for file in [self.store.db,Path(str(self.store.db)+'-wal'),self.store.folder/'backups']:
+            try:
+                stat=file.stat();parts.append(str(stat.st_mtime_ns)+':'+str(stat.st_size))
+            except OSError:parts.append('missing')
+        return __import__('hashlib').sha256('|'.join(parts).encode()).hexdigest()
 
     def action(self,path,d):
         s=self.store
@@ -134,6 +159,35 @@ class Application:
             s.activate(int(d['id']));return {}
         if path=='/api/settings':
             return s.set_settings(d)
+        if path=='/api/diagnostics':
+            self.diagnostic_result=diagnostics(s);return self.diagnostic_result
+        if path=='/api/backup':
+            return dict(name=create_backup(s))
+        if path=='/api/backup-import':
+            return import_backup(s,d.get('content_base64',''))
+        if path=='/api/restore':
+            if d.get('confirm') is not True:raise ValueError('请确认恢复所选备份，恢复前会另存当前记录')
+            with s.connect() as c:
+                active=c.execute("SELECT 1 FROM jobs WHERE status IN ('PENDING','RUNNING')").fetchone()
+            if active or is_busy():raise ValueError('请先暂停翻译并等待当前AI回复完成，再恢复备份')
+            result=restore_backup(s,str(d.get('name','')))
+            self.token=secrets.token_urlsafe(32)
+            return dict(result,reload=True)
+        if path=='/api/document-import':
+            return import_document(s,d)
+        if path=='/api/document-assign':
+            doc=document(s,int(d['document_id']));co=s.company()
+            if not co or doc['company_id'] is not None:raise ValueError('请先选择公司，仅通用阅读材料可以归档')
+            with s.connect() as c:c.execute('UPDATE documents SET company_id=? WHERE id=?',(co['id'],doc['id']))
+            return {}
+        if path=='/api/translate':
+            return start_translation(s,int(d['document_id']),d.get('ordinal'))
+        if path=='/api/translation-pause':
+            doc=document(s,int(d['document_id']))
+            with s.connect() as c:c.execute("UPDATE jobs SET status='PAUSED',updated=? WHERE document_id=? AND status IN ('PENDING','RUNNING')",(stamp(),doc['id']))
+            return {}
+        if path=='/api/translation-export':
+            return export_translation(s,int(d['document_id']))
         if path=='/api/pack':
             return s.pack()
         if path=='/api/refresh-pack':
@@ -219,6 +273,9 @@ class Application:
                         warning='未找到Node.js，已保留报告和完整估值JSON。'
                 return dict(files=files,warning=warning)
         if path=='/api/stop':
+            with s.connect() as c:
+                active=c.execute("SELECT 1 FROM jobs WHERE status IN ('PENDING','RUNNING')").fetchone()
+            if active or is_busy():raise ValueError('请先暂停翻译，并等待当前AI回复或当前段保存完成后，再退出本地服务')
             self.stop_event.set()
             threading.Thread(target=self.server.shutdown,daemon=True).start()
             return {}
@@ -227,23 +284,38 @@ class Application:
     def scheduler(self):
         while not self.stop_event.wait(20):
             try:
-                s=self.store;cfg=s.settings();co=s.company();at=now()
-                due=(cfg['reminder_enabled'] and co and co['stage']<6 and at.date().isoformat()>=cfg['start_date'] and at.strftime('%H:%M')>=cfg['reminder_time'] and (cfg['frequency']=='daily' or at.weekday()<5))
-                if due:
-                    with s.connect() as c:
-                        sent=c.execute('SELECT 1 FROM notifications WHERE company_id=? AND study_date=?',(co['id'],at.date().isoformat())).fetchone()
-                        finished=c.execute('SELECT 1 FROM packs WHERE company_id=? AND study_date=? AND status=?',(co['id'],at.date().isoformat(),'COMPLETED')).fetchone()
-                    if not sent and not finished:
-                        if cfg['sec_identity'] and co['cik']:
-                            try:
-                                with s.lock:
-                                    fetch_sec(s)
-                            except ValueError:
-                                pass
-                        s.schedule_tick(at)
+                create_backup(self.store,automatic=True)
+            except Exception:
+                with self.store.connect() as c:
+                    if not c.execute('SELECT 1 FROM events WHERE kind=? AND created LIKE ?',('自动备份未完成',now().date().isoformat()+'%')).fetchone():
+                        c.execute('INSERT INTO events(kind,detail,created) VALUES(?,?,?)',('自动备份未完成','请检查磁盘空间和目录权限，定时研究仍继续执行',stamp()))
+            try:
+                self.daily_tick()
             except Exception as exc:
                 with self.store.connect() as c:
                     c.execute('INSERT INTO events(kind,detail,created) VALUES(?,?,?)',('后台任务错误',type(exc).__name__,stamp()))
+
+    def daily_tick(self,at=None):
+        s=self.store;cfg=s.settings();co=s.company();at=at or now();day=at.date().isoformat()
+        if not (cfg['reminder_enabled'] and co and co['stage']<6 and day>=cfg['start_date'] and at.strftime('%H:%M')>=cfg['reminder_time'] and (cfg['frequency']=='daily' or at.weekday()<5)):return
+        with s.connect() as c:
+            if c.execute('SELECT 1 FROM packs WHERE company_id=? AND study_date=? AND status=?',(co['id'],day,'COMPLETED')).fetchone():return
+            run=c.execute('SELECT * FROM daily_runs WHERE company_id=? AND study_date=?',(co['id'],day)).fetchone()
+            if run and (run['status']=='READY' or run['attempts']>=3 or (run['next_retry'] and run['next_retry']>at.isoformat())):return
+        error=None
+        if cfg['sec_identity'] and co['cik']:
+            try:
+                with s.lock:fetch_sec(s)
+            except ValueError as exc:error=str(exc)
+        else:error='尚未配置SEC身份或公司CIK；配置后自动重试'
+        if not error:
+            try:s.refresh_pack(unanswered_only=True)
+            except ValueError:pass
+        s.schedule_tick(at)
+        attempts=(run['attempts'] if run else 0)+(1 if cfg['sec_identity'] and co['cik'] else 0)
+        retry=(at+dt.timedelta(minutes=[5,15,60][max(0,min(attempts-1,2))])).isoformat() if error else None
+        with s.connect() as c:
+            c.execute('INSERT OR REPLACE INTO daily_runs(company_id,study_date,attempts,status,next_retry,error) VALUES(?,?,?,?,?,?)',(co['id'],day,attempts,'RETRY' if error else 'READY',retry,error))
 
 def handler(app):
     class Handler(BaseHTTPRequestHandler):
@@ -271,11 +343,26 @@ def handler(app):
                 self.send(403,dict(error='仅允许本机访问'));return
             path=urlparse(self.path).path
             if path=='/api/health':
-                self.send(200,dict(app='equity-research-tutor',version='1.0'));return
-            if path=='/api/state':
+                self.send(200,dict(app='equity-research-tutor',version='1.1'));return
+            if path in ['/api/state','/api/revision']:
                 if self.headers.get('X-App-Token')!=app.token:
                     self.send(403,dict(error='请从本机首页打开'));return
-                self.send(200,app.store.state());return
+                self.send(200,app.state() if path=='/api/state' else dict(revision=app.revision()));return
+            if path.startswith('/backup-download/') or path.startswith('/document-file/'):
+                if self.headers.get('X-App-Token')!=app.token:
+                    self.send(403,dict(error='需要本地会话验证'));return
+                try:
+                    if path.startswith('/backup-download/'):
+                        name=path.removeprefix('/backup-download/')
+                        if Path(name).name!=name or '/' in name or '\\' in name or not name.endswith('.zip'):raise ValueError('备份名称无效')
+                        file=app.store.folder/'backups'/name
+                    else:
+                        doc=document(app.store,int(path.rsplit('/',1)[1]))
+                        ext=doc['source_kind'].split(':')[-1];file=app.store.folder/'documents'/(doc['sha256']+'.'+ext)
+                    if not file.is_file():raise ValueError('文件不存在')
+                    self.send(200,file.read_bytes(),mimetypes.guess_type(file.name)[0] or 'application/octet-stream',file.name);return
+                except (ValueError,KeyError):
+                    self.send(404,dict(error='文件不存在或不属于当前公司'));return
             if path.startswith('/downloads/'):
                 name=path.removeprefix('/downloads/')
                 if not name or Path(name).name!=name or '/' in name or '\\' in name or name.endswith('.png'):
@@ -284,7 +371,7 @@ def handler(app):
                 if file.is_file() and file.suffix in ['.xlsx','.md','.json']:
                     self.send(200,file.read_bytes(),mimetypes.guess_type(file.name)[0] or 'application/octet-stream',file.name);return
                 self.send(404,dict(error='文件不存在'));return
-            static={'/':'index.html','/app.js':'app.js','/styles.css':'styles.css','/favicon.svg':'favicon.svg'}
+            static={'/':'index.html','/app.js':'app.js','/v11.js':'v11.js','/styles.css':'styles.css','/favicon.svg':'favicon.svg'}
             if path in static:
                 file=ROOT/'static'/static[path]
                 content=file.read_bytes()
@@ -300,7 +387,8 @@ def handler(app):
                 self.send(403,dict(error='访问校验失败，请重新打开本机首页'));return
             try:
                 length=int(self.headers.get('Content-Length',0))
-                if not 0<length<=1_000_000:
+                maximum=26_000_000 if urlparse(self.path).path in ['/api/document-import','/api/backup-import'] else 1_000_000
+                if not 0<length<=maximum:
                     raise ValueError('请求内容过大或为空')
                 def reject_constant(value):
                     raise ValueError('不支持非有限数字：'+value)
@@ -320,6 +408,14 @@ def run(data_dir=None,port=8765,open_browser=False):
     app=Application(data_dir or ROOT/'data')
     server=ThreadingHTTPServer(('127.0.0.1',port),handler(app));app.server=server
     threading.Thread(target=app.scheduler,daemon=True).start()
+    threading.Thread(target=app.translation_worker.run,daemon=True).start()
+    def startup_checks():
+        try:
+            create_backup(app.store,automatic=True)
+            app.diagnostic_result=diagnostics(app.store)
+        except Exception:
+            with app.store.connect() as c:c.execute('INSERT INTO events(kind,detail,created) VALUES(?,?,?)',('启动检查','检查未完成，可在设置页重试',stamp()))
+    threading.Thread(target=startup_checks,daemon=True).start()
     if open_browser:
         import webbrowser
         webbrowser.open(f'http://127.0.0.1:{server.server_port}')

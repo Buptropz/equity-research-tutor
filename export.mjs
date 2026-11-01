@@ -26,7 +26,7 @@ summary.tabColor='#214B3D';model.tabColor='#78916C';
 for(const s of [summary,model,evidence])s.getRange('A1:A48').format.columnWidth=3;
 text(summary,'B2',`${d.company.ticker} 研究估值`);summary.getRange('B2').format.font.size=16;
 text(summary,'B4','当前情景');formula(summary,'C4',"='估值模型'!C5");summary.getRange('C4').format.font.color='#008000';
-summary.getRange('B6:C11').values=[['指标','当前模型'],['每股价值（USD）',null],['企业价值（百万USD）',null],['股权价值（百万USD）',null],['终值现值占比',null],['计算版本','fcff-roic-v1']];
+summary.getRange('B6:C11').values=[['指标','当前模型'],['每股价值（USD）',null],['企业价值（百万USD）',null],['股权价值（百万USD）',null],['终值现值占比',null],['计算版本',cases[1].version||'fcff-roic-v1']];
 for(const [r,ref] of [[7,31],[8,29],[9,30]])formula(summary,`C${r}`,`='估值模型'!C${ref}`);
 formula(summary,'C10',"='估值模型'!C28/'估值模型'!C29");summary.getRange('C7:C9').setNumberFormat(price);summary.getRange('C10').setNumberFormat('0.0%');
 text(summary,'B14','三情景比较（导出时的计算快照）');

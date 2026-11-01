@@ -1,0 +1,2 @@
+# Only needed when the active Python has no PDF reader and no bundled Codex Python is available.
+pypdf>=5.0

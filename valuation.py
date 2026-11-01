@@ -1,7 +1,7 @@
 """Deterministic FCFF model, USD millions, end-year discounting, version 1."""
 import math
 
-VERSION = 'fcff-roic-v1'
+VERSION = 'fcff-roic-v1.1'
 DEFAULTS = dict(revenue=1000, cash=0, debt=0, other_claims=0, shares=100,
                 growth=.10, margin=.25, tax=.21, roic=.20, wacc=.10,
                 terminal_growth=.025, terminal_roic=.12, years=5)
@@ -66,8 +66,8 @@ def scenarios(raw):
     a = validate(raw)
     cases = []
     for name, delta in [('保守', -.03), ('基准', 0), ('乐观', .03)]:
-        b = dict(a, growth=max(0, min(a['roic'], a['growth'] + delta)),
-                 margin=max(.01, min(1, a['margin'] + delta)))
+        b = dict(a) if delta == 0 else dict(a, growth=max(0, min(a['roic'], a['growth'] + delta)),
+                 margin=max(.000001, min(1, a['margin'] + delta)))
         cases.append(dict(name=name, **dcf(b)))
     sensitivity = []
     for dw in [-.02, -.01, 0, .01, .02]:
