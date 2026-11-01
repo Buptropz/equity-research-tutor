@@ -4,3 +4,16 @@
 .chat-message{padding:20px 0;border-bottom:1px solid var(--line)}.chat-message h3{font-size:12px}.chat-message.from-user{background:#f7faf2;padding:18px;border-radius:8px;margin:15px 0}.chat-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.9}#chat-history{margin-bottom:25px}
 .bilingual{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px}.bilingual .card{min-width:0}.report-text{white-space:pre-wrap;overflow-wrap:anywhere;tab-size:4;font:13px/1.95 "Microsoft YaHei UI","Microsoft YaHei",sans-serif;max-height:720px;overflow:auto;color:#344e42}.bilingual .card-head{align-items:flex-start;flex-wrap:wrap}#update-banner:not([hidden]){padding:12px 46px;background:#f4efd9;border-bottom:1px solid #e5dcbf;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;color:#7e682c}#maintenance-panel{scroll-margin-top:20px}[hidden]{display:none!important}@media(max-width:1000px){.bilingual{grid-template-columns:1fr}.report-text{max-height:520px}}@media(max-width:520px){#update-banner:not([hidden]){padding:12px 20px;align-items:flex-start;flex-direction:column}}
 .field-hint,.subtle,.card h2,.card h3{overflow-wrap:anywhere}.row>div{min-width:0}
+
+.sidebar>nav{min-height:0;overflow-y:auto}.sidebar>.brand,.sidebar>.nav-label,.sidebar-bottom{flex-shrink:0}
+.translation-shortcut{display:flex;align-items:center;gap:9px;margin:0 -5px 20px;padding:10px 8px;border:1px solid #e4d4cd;border-radius:12px;background:#fcf7f0;color:#8b303a;transition:background .16s,border-color .16s,box-shadow .16s}
+.translation-shortcut-icon{width:36px;height:40px;display:grid;place-items:center;flex-shrink:0;border-radius:10px;background:linear-gradient(145deg,#b84145,#701e2b);color:#fff0d0;box-shadow:0 3px 8px #701e2b14}
+.translation-shortcut-icon svg{display:block;width:30px;height:30px}
+.translation-shortcut-copy{min-width:0}.translation-shortcut-copy strong{display:block;font-size:12px;font-weight:600;white-space:nowrap}.translation-shortcut-copy>span{display:block;margin-top:3px;font-size:9px;color:#a47c72;white-space:nowrap}
+.translation-shortcut:hover,.translation-shortcut.active{background:#f6e8e1;border-color:#c88c86;box-shadow:0 4px 14px #701e2b0a}.translation-shortcut:focus-visible{outline:3px solid #b84145;outline-offset:4px}
+@media(max-width:850px){
+ .sidebar>nav{overflow:visible}.sidebar-bottom{display:block;position:fixed;left:18px;bottom:18px;bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:80;padding:0;margin:0}.sidebar-bottom .local-status{display:none}
+ .translation-shortcut{width:56px;height:56px;margin:0;padding:0;justify-content:center;border:1px solid #87303a;border-radius:16px;background:linear-gradient(145deg,#b84145,#701e2b);box-shadow:0 5px 18px #701e2b28}
+ .translation-shortcut:hover,.translation-shortcut.active{background:linear-gradient(145deg,#b84145,#701e2b);border-color:#e7bd9e;box-shadow:0 5px 18px #701e2b38}.translation-shortcut-icon{width:44px;height:44px;background:none;box-shadow:none}.translation-shortcut-icon svg{width:36px;height:36px}.translation-shortcut-copy{display:none}
+ main{padding-bottom:100px}#toast{bottom:88px}#busy:not([hidden]){bottom:88px}
+}

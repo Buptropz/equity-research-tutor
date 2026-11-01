@@ -64,6 +64,8 @@ render=function(){
    if(last&&last.revision!==p.revision)$('#main').insertAdjacentHTML('afterbegin','<div class="warning-box">资料已更新。下方保留的是旧版回答，修改或审核后请提交当前版本；旧版原始回答和证据仍可在历史中查看。</div>');
   }
  }
+ const shortcut=$('#translation-shortcut');
+ if(shortcut){const reading=page()==='translation';shortcut.classList.toggle('active',reading);if(reading)shortcut.setAttribute('aria-current','page');else shortcut.removeAttribute('aria-current')}
  restoreForms();
  const footer=document.querySelector('footer');if(footer&&!footer.querySelector('[data-version]'))footer.insertAdjacentHTML('beforeend',`<span data-version>V${e(S.version||'1.1.1')}</span>`);
  if(S.revision)lastRevision=S.revision;
